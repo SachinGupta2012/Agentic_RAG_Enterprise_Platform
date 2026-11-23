@@ -13,6 +13,7 @@ from app.retrieval.schemas import RetrievalFilters, RetrievalSearchRequest
 from app.retrieval.store import (
     QdrantTicketStore,
     RetrievalCollectionMissing,
+    RetrievalDimensionMismatch,
     RetrievalNotConfigured,
     TicketDocument,
     build_filter,
@@ -27,9 +28,16 @@ class FakeClient:
         self.query_kwargs: dict[str, Any] | None = None
         self.exists = True
         self.count_value = 16000
+        self.vector_size = 384
 
     def collection_exists(self, collection_name: str) -> bool:
         return self.exists
+
+    def get_collection(self, collection_name: str) -> SimpleNamespace:
+        vector = SimpleNamespace(size=self.vector_size, distance="Cosine")
+        return SimpleNamespace(
+            config=SimpleNamespace(params=SimpleNamespace(vectors={"dense": vector}))
+        )
 
     def count(self, collection_name: str, exact: bool = True) -> SimpleNamespace:
         return SimpleNamespace(count=self.count_value)
@@ -208,3 +216,94 @@ def test_unconfigured_store_does_not_create_client() -> None:
 
     with pytest.raises(RetrievalNotConfigured):
         store.health()
+
+
+def test_hybrid_is_the_default_mode() -> None:
+    assert RetrievalSearchRequest(query="account portal offline").mode == "hybrid"
+
+
+def test_dense_mode_queries_only_the_dense_vector() -> None:
+    client = FakeClient()
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    response = store.search(
+        RetrievalSearchRequest(query="account portal offline", mode="dense", top_k=3)
+    )
+
+    assert client.query_kwargs is not None
+    assert client.query_kwargs["using"] == "dense"
+    assert "prefetch" not in client.query_kwargs
+    assert client.query_kwargs["query"].model == "sentence-transformers/all-minilm-l6-v2"
+    assert client.query_kwargs["limit"] == 3
+    assert response.retrieval_mode == "dense"
+    assert response.hits[0].score_type == "dense"
+
+
+def test_sparse_mode_queries_only_the_bm25_vector() -> None:
+    client = FakeClient()
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    response = store.search(
+        RetrievalSearchRequest(query="account portal offline", mode="sparse", top_k=3)
+    )
+
+    assert client.query_kwargs is not None
+    assert client.query_kwargs["using"] == "bm25"
+    assert "prefetch" not in client.query_kwargs
+    assert client.query_kwargs["query"].model == "qdrant/bm25"
+    assert response.retrieval_mode == "sparse"
+    assert response.hits[0].score_type == "sparse"
+
+
+def test_single_mode_applies_metadata_filters() -> None:
+    client = FakeClient()
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    store.search(
+        RetrievalSearchRequest(
+            query="portal offline",
+            mode="sparse",
+            filters=RetrievalFilters(category="Incident"),
+        )
+    )
+
+    assert client.query_kwargs is not None
+    query_filter = client.query_kwargs["query_filter"]
+    assert query_filter is not None
+    assert {condition.key for condition in query_filter.must} == {"category"}
+
+
+def test_rrf_k_is_configurable() -> None:
+    client = FakeClient()
+    settings = _settings().model_copy(update={"retrieval_rrf_k": 17})
+    store = QdrantTicketStore(settings=settings, client=client)  # type: ignore[arg-type]
+
+    store.search(RetrievalSearchRequest(query="account portal offline"))
+
+    assert client.query_kwargs is not None
+    assert client.query_kwargs["query"].rrf.k == 17
+
+
+def test_dimension_mismatch_raises() -> None:
+    client = FakeClient()
+    client.vector_size = 768
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(RetrievalDimensionMismatch, match="does not match"):
+        store.validate_collection_dimensions()
+
+
+def test_health_fails_on_dimension_mismatch() -> None:
+    client = FakeClient()
+    client.vector_size = 768
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(RetrievalDimensionMismatch):
+        store.health()
+
+
+def test_dimension_matches_collection() -> None:
+    client = FakeClient()
+    store = QdrantTicketStore(settings=_settings(), client=client)  # type: ignore[arg-type]
+
+    assert store.validate_collection_dimensions() == 384

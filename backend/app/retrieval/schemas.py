@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+RetrievalMode = Literal["dense", "sparse", "hybrid"]
+
 
 class RetrievalFilters(BaseModel):
     """Optional metadata filters applied to both dense and sparse retrieval."""
@@ -46,6 +48,7 @@ class RetrievalSearchRequest(BaseModel):
     query: str = Field(min_length=3, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=50)
     prefetch_limit: int | None = Field(default=None, ge=10, le=200)
+    mode: RetrievalMode = "hybrid"
     filters: RetrievalFilters = Field(default_factory=RetrievalFilters)
 
     @field_validator("query")
@@ -62,7 +65,7 @@ class RetrievalHit(BaseModel):
 
     ticket_id: str
     score: float
-    score_type: Literal["rrf"] = "rrf"
+    score_type: Literal["rrf", "dense", "sparse"] = "rrf"
     subject: str
     snippet: str
     resolution_snippet: str | None = None
@@ -84,7 +87,7 @@ class RetrievalSearchResponse(BaseModel):
     query: str
     hits: list[RetrievalHit]
     count: int
-    retrieval_mode: Literal["hybrid_rrf"] = "hybrid_rrf"
+    retrieval_mode: Literal["dense", "sparse", "hybrid_rrf"] = "hybrid_rrf"
     dense_model: str
     sparse_model: str
     collection: str

@@ -96,10 +96,14 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
-pythonpath = ["backend"]
+pythonpath = ["backend", "."]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: read-only contracts that require a live external service",
+    "slow: tests that take noticeably longer than a unit test",
+]
 
 [tool.coverage.run]
 source = ["backend/app"]

@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from qdrant_client import QdrantClient, models
@@ -30,6 +30,8 @@ from app.retrieval.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Default dense vector size. Override with QDRANT_DENSE_VECTOR_SIZE when the
+# configured inference model emits a different dimension.
 DENSE_VECTOR_SIZE = 384
 PAYLOAD_INDEXES: dict[str, Any] = {
     "category": models.PayloadSchemaType.KEYWORD,
@@ -58,6 +60,10 @@ class RetrievalCollectionMissing(RetrievalError):
 
 class RetrievalUnavailable(RetrievalError):
     """Qdrant could not be reached or returned an unexpected error."""
+
+
+class RetrievalDimensionMismatch(RetrievalError):
+    """The configured dense dimension does not match the stored collection."""
 
 
 @dataclass(frozen=True)
@@ -235,7 +241,7 @@ class QdrantTicketStore:
                 collection_name=self._collection,
                 vectors_config={
                     self._settings.qdrant_dense_vector: models.VectorParams(
-                        size=DENSE_VECTOR_SIZE,
+                        size=self._settings.qdrant_dense_vector_size,
                         distance=models.Distance.COSINE,
                     ),
                 },
@@ -245,6 +251,33 @@ class QdrantTicketStore:
             )
 
         self._ensure_payload_indexes()
+        self.validate_collection_dimensions()
+
+    def validate_collection_dimensions(self) -> int:
+        """Fail fast when the configured dense size differs from the collection."""
+
+        info = self.client.get_collection(self._collection)
+        vectors = info.config.params.vectors
+        if isinstance(vectors, Mapping):
+            params = vectors.get(self._settings.qdrant_dense_vector)
+        else:
+            params = vectors
+
+        if params is None:
+            raise RetrievalDimensionMismatch(
+                f"Collection {self._collection!r} has no dense vector named "
+                f"{self._settings.qdrant_dense_vector!r}."
+            )
+
+        actual = int(params.size)
+        expected = self._settings.qdrant_dense_vector_size
+        if actual != expected:
+            raise RetrievalDimensionMismatch(
+                f"Configured dense size {expected} does not match collection "
+                f"{self._collection!r} size {actual}. Update "
+                "QDRANT_DENSE_VECTOR_SIZE or re-index with a matching model."
+            )
+        return actual
 
     def _ensure_payload_indexes(self) -> None:
         info = self.client.get_collection(self._collection)
@@ -280,6 +313,7 @@ class QdrantTicketStore:
                 raise RetrievalCollectionMissing(
                     "Retrieval index is not ready. Run scripts/ingest_qdrant.py."
                 )
+            self.validate_collection_dimensions()
             count = self.count()
         except RetrievalError:
             raise
@@ -342,43 +376,59 @@ class QdrantTicketStore:
             )
         return written
 
+    def fetch_payloads(
+        self,
+        ids: Sequence[str],
+        batch_size: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch stored payloads by point ID without reading vectors."""
+
+        size = batch_size or self._settings.retrieval_batch_size
+        if size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        payloads: dict[str, dict[str, Any]] = {}
+        try:
+            for start in range(0, len(ids), size):
+                batch = list(ids[start : start + size])
+                points = self.client.retrieve(
+                    collection_name=self._collection,
+                    ids=batch,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payloads[str(point.id)] = dict(point.payload or {})
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) == 404:
+                raise RetrievalCollectionMissing(
+                    "Retrieval index is not ready. Run scripts/ingest_qdrant.py."
+                ) from exc
+            raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
+        except RetrievalError:
+            raise
+        except Exception as exc:
+            raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
+        return payloads
+
     def search(self, request: RetrievalSearchRequest) -> RetrievalSearchResponse:
-        """Run dense + BM25 prefetches and fuse them with RRF."""
+        """Run dense, sparse, or hybrid retrieval depending on the request mode."""
 
         query, query_counts = redact_pii(request.query)
         query_filter = build_filter(request.filters)
-        prefetch_limit = request.prefetch_limit or self._settings.retrieval_prefetch_limit
         started = time.perf_counter()
+        score_type: Literal["rrf", "dense", "sparse"]
+        retrieval_mode: Literal["dense", "sparse", "hybrid_rrf"]
 
         try:
-            response = self.client.query_points(
-                collection_name=self._collection,
-                prefetch=[
-                    models.Prefetch(
-                        query=models.Document(
-                            text=query,
-                            model=self._settings.qdrant_dense_model,
-                        ),
-                        using=self._settings.qdrant_dense_vector,
-                        filter=query_filter,
-                        limit=prefetch_limit,
-                    ),
-                    models.Prefetch(
-                        query=models.Document(
-                            text=query,
-                            model=self._settings.qdrant_sparse_model,
-                        ),
-                        using=self._settings.qdrant_sparse_vector,
-                        filter=query_filter,
-                        limit=prefetch_limit,
-                    ),
-                ],
-                query=models.RrfQuery(rrf=models.Rrf(k=60)),
-                query_filter=query_filter,
-                limit=request.top_k,
-                with_payload=True,
-                with_vectors=False,
-            )
+            if request.mode == "hybrid":
+                points = self._hybrid_points(query, query_filter, request)
+                score_type = "rrf"
+                retrieval_mode = "hybrid_rrf"
+            else:
+                points = self._single_points(query, query_filter, request, request.mode)
+                score_type = request.mode
+                retrieval_mode = request.mode
         except UnexpectedResponse as exc:
             if getattr(exc, "status_code", None) == 404:
                 raise RetrievalCollectionMissing(
@@ -391,7 +441,7 @@ class QdrantTicketStore:
             raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
-        hits = [self._to_hit(point) for point in response.points]
+        hits = [self._to_hit(point, score_type) for point in points]
         warnings: list[str] = []
         if query_counts.total:
             warnings.append("Query contained PII patterns; they were redacted before embedding.")
@@ -400,6 +450,7 @@ class QdrantTicketStore:
             query=query,
             hits=hits,
             count=len(hits),
+            retrieval_mode=retrieval_mode,
             dense_model=self._settings.qdrant_dense_model,
             sparse_model=self._settings.qdrant_sparse_model,
             collection=self._collection,
@@ -408,7 +459,73 @@ class QdrantTicketStore:
             warnings=warnings,
         )
 
-    def _to_hit(self, point: Any) -> RetrievalHit:
+    def _hybrid_points(
+        self,
+        query: str,
+        query_filter: models.Filter | None,
+        request: RetrievalSearchRequest,
+    ) -> Sequence[Any]:
+        """Dense + BM25 prefetches fused with RRF."""
+
+        prefetch_limit = request.prefetch_limit or self._settings.retrieval_prefetch_limit
+        response = self.client.query_points(
+            collection_name=self._collection,
+            prefetch=[
+                models.Prefetch(
+                    query=models.Document(
+                        text=query,
+                        model=self._settings.qdrant_dense_model,
+                    ),
+                    using=self._settings.qdrant_dense_vector,
+                    filter=query_filter,
+                    limit=prefetch_limit,
+                ),
+                models.Prefetch(
+                    query=models.Document(
+                        text=query,
+                        model=self._settings.qdrant_sparse_model,
+                    ),
+                    using=self._settings.qdrant_sparse_vector,
+                    filter=query_filter,
+                    limit=prefetch_limit,
+                ),
+            ],
+            query=models.RrfQuery(rrf=models.Rrf(k=self._settings.retrieval_rrf_k)),
+            query_filter=query_filter,
+            limit=request.top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return response.points
+
+    def _single_points(
+        self,
+        query: str,
+        query_filter: models.Filter | None,
+        request: RetrievalSearchRequest,
+        mode: str,
+    ) -> Sequence[Any]:
+        """Dense-only or BM25-only retrieval without fusion."""
+
+        if mode == "dense":
+            using = self._settings.qdrant_dense_vector
+            model = self._settings.qdrant_dense_model
+        else:
+            using = self._settings.qdrant_sparse_vector
+            model = self._settings.qdrant_sparse_model
+
+        response = self.client.query_points(
+            collection_name=self._collection,
+            query=models.Document(text=query, model=model),
+            using=using,
+            query_filter=query_filter,
+            limit=request.top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return response.points
+
+    def _to_hit(self, point: Any, score_type: Literal["rrf", "dense", "sparse"]) -> RetrievalHit:
         payload: Mapping[str, Any] = point.payload or {}
         subject = str(payload.get("subject") or "")
         customer_query = str(payload.get("customer_query") or payload.get("text") or "")
@@ -441,6 +558,7 @@ class QdrantTicketStore:
         return RetrievalHit(
             ticket_id=str(payload.get("ticket_id") or point.id),
             score=float(point.score),
+            score_type=score_type,
             subject=subject,
             snippet=_snippet(customer_query),
             resolution_snippet=resolution_snippet,

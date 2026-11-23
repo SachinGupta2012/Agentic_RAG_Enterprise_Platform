@@ -1,6 +1,7 @@
 """Application settings loaded from environment variables and `.env`."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,9 +33,12 @@ class Settings(BaseSettings):
     qdrant_sparse_model: str = "qdrant/bm25"
     qdrant_dense_vector: str = "dense"
     qdrant_sparse_vector: str = "bm25"
+    qdrant_dense_vector_size: int = Field(default=384, ge=1)
 
     # Retrieval behaviour.
+    retrieval_default_mode: Literal["dense", "sparse", "hybrid"] = "hybrid"
     retrieval_prefetch_limit: int = 50
+    retrieval_rrf_k: int = Field(default=60, ge=1)
     retrieval_timeout_seconds: int = 60
     retrieval_batch_size: int = 64
 

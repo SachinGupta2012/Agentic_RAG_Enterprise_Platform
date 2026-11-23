@@ -16,6 +16,7 @@ from app.retrieval.schemas import (
 from app.retrieval.store import (
     QdrantTicketStore,
     RetrievalCollectionMissing,
+    RetrievalDimensionMismatch,
     RetrievalNotConfigured,
     RetrievalUnavailable,
 )
@@ -28,13 +29,13 @@ router = APIRouter(prefix="/retrieval", tags=["retrieval"])
 @router.post(
     "/search",
     response_model=RetrievalSearchResponse,
-    summary="Hybrid search over the historical ticket corpus",
+    summary="Search over the historical ticket corpus",
 )
 def search(
     request: RetrievalSearchRequest,
     store: Annotated[QdrantTicketStore, Depends(get_ticket_store)],
 ) -> RetrievalSearchResponse:
-    """Search the retrieval corpus with dense + BM25 prefetches fused by RRF."""
+    """Run dense, sparse, or hybrid retrieval based on the request mode."""
 
     try:
         return store.search(request)
@@ -42,6 +43,11 @@ def search(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Retrieval service is not configured.",
+        ) from exc
+    except RetrievalDimensionMismatch as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Retrieval index configuration does not match the collection.",
         ) from exc
     except RetrievalCollectionMissing as exc:
         raise HTTPException(

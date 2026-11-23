@@ -55,6 +55,19 @@ original creation time.
 The evaluation split must never be embedded or ingested into Qdrant. Near-duplicate clusters are
 kept intact within a single split to prevent leakage.
 
+### Use of the splits after Phase 1
+
+| Split | Used for | Not used for |
+| --- | --- | --- |
+| `retrieval` | Qdrant corpus and retrieval | Evaluation queries |
+| `dev` | Query selection, tuning, relevance judging, manual verification | Final independent benchmark |
+| `eval` | Nothing yet; quarantined | Query selection, judging, tuning, indexing |
+
+Because whole near-duplicate clusters stay inside one split, a dev ticket has no near-duplicate in
+the retrieval corpus. Retrieval evaluation therefore cannot use the dev ticket as a guaranteed gold
+answer; relevance has to be judged from pooled candidates. See
+[`docs/evaluation.md`](evaluation.md).
+
 ## Internal schema
 
 | Field | Type | Notes |
