@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
@@ -19,6 +19,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.core.config import Settings, get_settings
+from app.core.io_budget import BudgetExceeded, read_timeout
 from app.retrieval.pii import RedactionCounts, redact_pii
 from app.retrieval.schemas import (
     RetrievalFilters,
@@ -88,6 +89,8 @@ class TicketDocument:
     sparse_text: str
     display_text: str
     pii_redactions: RedactionCounts
+    text_profile: str = "legacy-char-v1"
+    text_token_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _snippet(text: str, max_chars: int = 320) -> str:
@@ -144,6 +147,8 @@ def build_point(
         "resolution_status": document.resolution_status,
         "pii_redactions": document.pii_redactions.as_dict(),
         "schema_version": "phase2-v1",
+        "index_text_profile": document.text_profile,
+        "text_token_counts": document.text_token_counts,
         "split": "retrieval",
     }
 
@@ -396,6 +401,7 @@ class QdrantTicketStore:
                     ids=batch,
                     with_payload=True,
                     with_vectors=False,
+                    **read_timeout(),
                 )
                 for point in points:
                     payloads[str(point.id)] = dict(point.payload or {})
@@ -405,7 +411,7 @@ class QdrantTicketStore:
                     "Retrieval index is not ready. Run scripts/ingest_qdrant.py."
                 ) from exc
             raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
-        except RetrievalError:
+        except (RetrievalError, BudgetExceeded):
             raise
         except Exception as exc:
             raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
@@ -435,7 +441,7 @@ class QdrantTicketStore:
                     "Retrieval index is not ready. Run scripts/ingest_qdrant.py."
                 ) from exc
             raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
-        except RetrievalError:
+        except (RetrievalError, BudgetExceeded):
             raise
         except Exception as exc:
             raise RetrievalUnavailable("Retrieval service is unavailable.") from exc
@@ -495,6 +501,7 @@ class QdrantTicketStore:
             limit=request.top_k,
             with_payload=True,
             with_vectors=False,
+            **read_timeout(),
         )
         return response.points
 
@@ -522,6 +529,7 @@ class QdrantTicketStore:
             limit=request.top_k,
             with_payload=True,
             with_vectors=False,
+            **read_timeout(),
         )
         return response.points
 

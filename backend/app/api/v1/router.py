@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import responses, retrieval
+from app.api.v1 import orchestration, responses, retrieval
 
 api_router = APIRouter()
 
@@ -16,3 +16,4 @@ def health() -> dict[str, str]:
 
 api_router.include_router(retrieval.router)
 api_router.include_router(responses.router)
+api_router.include_router(orchestration.router)

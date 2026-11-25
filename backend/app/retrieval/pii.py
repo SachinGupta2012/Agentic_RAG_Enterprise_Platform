@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 
 EMAIL_PATTERN = re.compile(
-    r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])",
+    r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w-]|\.[\w-])",
     re.IGNORECASE,
 )
 URL_PATTERN = re.compile(r"\b(?:https?://|www\.)[^\s<>()]+", re.IGNORECASE)

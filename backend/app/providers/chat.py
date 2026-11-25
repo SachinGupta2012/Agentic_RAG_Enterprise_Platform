@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.core.io_budget import active_budget
 from app.generation.config import GenerationSettings, Provider
 
 
@@ -164,8 +165,12 @@ class HTTPChatClient:
         ) as client:
             for attempt in range(2):
                 reservation = self.budget.reserve(tokens)
+                run_budget = active_budget.get()
+                timeout = self.settings.timeout_seconds
+                if run_budget is not None:
+                    timeout = min(timeout, run_budget.reserve("llm", tokens))
                 try:
-                    response = client.post(url, headers=headers, json=payload)
+                    response = client.post(url, headers=headers, json=payload, timeout=timeout)
                 except httpx.TransportError as exc:
                     # A timeout can occur after billing/completion; never blindly resend.
                     raise ProviderError(

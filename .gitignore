@@ -26,6 +26,7 @@ htmlcov/
 data/raw/*
 data/interim/*
 data/processed/*
+data/preprocessing_runs/
 data/eval/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep

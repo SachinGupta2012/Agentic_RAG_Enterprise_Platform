@@ -1,7 +1,7 @@
 """Ingest the retrieval split into Qdrant Cloud.
 
 Usage:
-    uv run --extra retrieval python scripts/ingest_qdrant.py --recreate
+    uv run --extra retrieval python scripts/ingest_qdrant.py --dry-run
 
 The script refuses to ingest if the retrieval file does not match the manifest,
 if any row is unresolved or non-English, or if retrieval identifiers overlap the
@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from app.core.config import get_settings
+from app.core.config import PreprocessingSettings, get_settings
 from app.retrieval.ingestion import (
     IngestionValidationError,
     aggregate_redactions,
@@ -49,26 +49,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Split manifest with SHA-256 checksums.",
     )
     parser.add_argument(
-        "--dev",
-        type=Path,
-        default=Path("data/processed/tickets_dev.parquet"),
-        help="Dev split, used only for an overlap check.",
-    )
-    parser.add_argument(
-        "--eval",
-        type=Path,
-        default=Path("data/processed/tickets_eval.parquet"),
-        help="Eval split, used only for an overlap check.",
-    )
-    parser.add_argument(
         "--collection",
         default=None,
         help="Override the Qdrant collection name.",
-    )
-    parser.add_argument(
-        "--recreate",
-        action="store_true",
-        help="Delete and recreate the collection before ingesting.",
     )
     parser.add_argument(
         "--batch-size",
@@ -103,7 +86,23 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
 
     try:
+        if settings.qdrant_dense_model != PreprocessingSettings().dense_model:
+            raise IngestionValidationError(
+                "Dense model does not match the pinned tokenizer profile"
+            )
+        if args.limit is not None and args.limit < 1:
+            raise IngestionValidationError("--limit must be positive")
+        if not args.dry_run and (
+            not args.collection or args.collection == settings.qdrant_collection
+        ):
+            raise IngestionValidationError(
+                "Token-aware writes require an explicitly named NEW collection; the existing corpus is protected"
+            )
         manifest = load_manifest(args.manifest)
+        if not isinstance(manifest.get("isolation"), dict):
+            raise IngestionValidationError(
+                "Missing trusted split-isolation sidecar; no evaluation-file fallback is permitted"
+            )
         source_sha256 = validate_checksum(args.input, manifest, "retrieval")
         retrieval_entry = manifest["files"]["retrieval"]
         expected_rows = int(retrieval_entry["rows"])
@@ -111,8 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         frame = load_parquet(args.input)
         validate_retrieval_frame(frame, expected_rows)
 
-        retrieval_ids = {str(value) for value in frame["ticket_id"].tolist()}
-        validate_split_isolation(retrieval_ids, args.dev, args.eval)
+        validate_split_isolation(frame, manifest, args.manifest)
 
         documents = prepare_documents(frame, limit=args.limit)
     except (IngestionValidationError, KeyError, ValueError) as exc:
@@ -135,7 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     store = QdrantTicketStore(settings=settings, collection_name=args.collection)
     started = time.perf_counter()
     try:
-        store.ensure_collection(recreate=args.recreate)
+        if store.client.collection_exists(store.collection_name):
+            raise IngestionValidationError(
+                "Destination already exists; refusing to replace or mix text profiles"
+            )
+        store.ensure_collection(recreate=False)
         written = store.upsert_documents(documents, batch_size=args.batch_size)
         collection_count = store.count()
     except Exception as exc:

@@ -1,8 +1,7 @@
 """Validation and preparation of the retrieval split for Qdrant ingestion.
 
-The evaluation split is never loaded for indexing. The ingestion script reads
-only `tickets_retrieval.parquet` and uses the dev/eval files solely to prove
-that no identifier overlaps exist.
+Only the retrieval file is loaded. Held-out isolation is checked against a
+checksum-bound sidecar created when the raw source was first split.
 """
 
 from __future__ import annotations
@@ -17,6 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from app.core.config import PreprocessingSettings
+from app.preprocessing.isolation import load_isolation, reject_evaluation_path, verify_frame
+from app.preprocessing.tokens import TEXT_PROFILE, TOKENIZER_SHA256, token_count, token_prefix
 from app.retrieval.pii import RedactionCounts, redact_pii
 from app.retrieval.store import TicketDocument
 
@@ -35,8 +37,6 @@ REQUIRED_COLUMNS = (
     "source_dataset",
     "metadata",
 )
-DENSE_TEXT_LIMIT = 2000
-SPARSE_TEXT_LIMIT = 8000
 
 
 class IngestionValidationError(ValueError):
@@ -61,6 +61,7 @@ class IngestionReport:
     pii_redactions: dict[str, int]
     duration_seconds: float
     warnings: list[str]
+    text_handling: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -80,6 +81,7 @@ class IngestionReport:
             "pii_redactions": self.pii_redactions,
             "duration_seconds": self.duration_seconds,
             "warnings": self.warnings,
+            "text_handling": self.text_handling,
         }
 
 
@@ -107,6 +109,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
 def validate_checksum(path: Path, manifest: Mapping[str, Any], split: str) -> str:
     """Verify a split file against the manifest checksum."""
 
+    if split not in {"retrieval", "dev"}:
+        raise IngestionValidationError("Evaluation data is quarantined")
+    reject_evaluation_path(path)
     files = manifest.get("files")
     if not isinstance(files, Mapping) or split not in files:
         raise IngestionValidationError(f"Manifest has no entry for split {split!r}.")
@@ -127,6 +132,7 @@ def validate_checksum(path: Path, manifest: Mapping[str, Any], split: str) -> st
 def load_parquet(path: Path, columns: Sequence[str] | None = None) -> Any:
     """Load a Parquet file, importing pandas only when ingestion is run."""
 
+    reject_evaluation_path(path)
     if not path.is_file():
         raise IngestionValidationError(f"Data file not found: {path}")
     try:
@@ -177,7 +183,7 @@ def validate_retrieval_frame(frame: Any, expected_rows: int | None = None) -> No
         try:
             uuid.UUID(str(value))
         except (ValueError, TypeError) as exc:
-            raise IngestionValidationError(f"Invalid ticket_id: {value!r}") from exc
+            raise IngestionValidationError("Invalid ticket_id UUID") from exc
 
     if not (frame["resolution_status"] == "resolved").all():
         raise IngestionValidationError(
@@ -189,31 +195,20 @@ def validate_retrieval_frame(frame: Any, expected_rows: int | None = None) -> No
 
     if frame["source_dataset"].isna().any():
         raise IngestionValidationError("source_dataset must be present on every row.")
-
-
-def load_split_ids(path: Path) -> set[str]:
-    """Load only the ticket identifiers from a split file."""
-
-    frame = load_parquet(path, columns=["ticket_id"])
-    return {str(value) for value in frame["ticket_id"].tolist()}
+    if any(parse_metadata(value).get("split") != "retrieval" for value in frame["metadata"]):
+        raise IngestionValidationError("Only rows marked retrieval may be indexed")
 
 
 def validate_split_isolation(
-    retrieval_ids: set[str],
-    dev_path: Path,
-    eval_path: Path,
+    frame: Any,
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
 ) -> None:
-    """Fail if retrieval shares any identifier with dev or eval."""
-
-    for label, path in (("dev", dev_path), ("eval", eval_path)):
-        if not path.is_file():
-            continue
-        overlap = retrieval_ids & load_split_ids(path)
-        if overlap:
-            examples = ", ".join(sorted(overlap)[:5])
-            raise IngestionValidationError(
-                f"Retrieval split overlaps the {label} split ({len(overlap)} ids): {examples}"
-            )
+    """Certify IDs, issues and clusters without opening held-out data."""
+    try:
+        verify_frame(frame, "retrieval", load_isolation(manifest, manifest_path))
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise IngestionValidationError(f"Isolation validation failed: {exc}") from exc
 
 
 def parse_tags(value: Any) -> tuple[str, ...]:
@@ -252,13 +247,6 @@ def parse_metadata(value: Any) -> dict[str, Any]:
     return parsed
 
 
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    cut = text[:limit].rsplit(" ", 1)[0].rstrip()
-    return f"{cut}..."
-
-
 def _source_row_index(metadata: Mapping[str, Any]) -> int | None:
     value = metadata.get("source_row_index")
     if value is None or isinstance(value, bool):
@@ -271,7 +259,9 @@ def _source_row_index(metadata: Mapping[str, Any]) -> int | None:
         return None
 
 
-def record_to_document(row: Mapping[str, Any]) -> TicketDocument:
+def record_to_document(
+    row: Mapping[str, Any], settings: PreprocessingSettings | None = None
+) -> TicketDocument:
     """Redact one row and build the text used for dense and sparse vectors."""
 
     subject = str(row["subject"]).strip()
@@ -289,14 +279,21 @@ def record_to_document(row: Mapping[str, Any]) -> TicketDocument:
     if not source_version:
         source_version = None
 
-    dense_text = _truncate(
-        f"Subject: {subject}\n\nCustomer issue:\n{customer_query}",
-        DENSE_TEXT_LIMIT,
+    settings = settings or PreprocessingSettings()
+    issue = f"Subject: {subject}\n\nCustomer issue:\n{customer_query}"
+    complete = f"{issue}\n\nResolution:\n{agent_response}"
+    dense = token_prefix(issue, settings.dense_max_tokens)
+    # Reserve room for the resolution instead of allowing a long question to crowd it out.
+    issue_part = token_prefix(
+        issue, int(settings.sparse_max_tokens * settings.sparse_issue_fraction)
     )
-    sparse_text = _truncate(
-        f"Subject: {subject}\n\nCustomer issue:\n{customer_query}\n\nResolution:\n{agent_response}",
-        SPARSE_TEXT_LIMIT,
+    answer_part = token_prefix(
+        f"Resolution:\n{agent_response}",
+        settings.sparse_max_tokens
+        - int(settings.sparse_max_tokens * settings.sparse_issue_fraction),
     )
+    sparse = token_prefix(f"{issue_part.text}\n\n{answer_part.text}", settings.sparse_max_tokens)
+    sparse_original = token_count(complete)
 
     return TicketDocument(
         ticket_id=str(row["ticket_id"]).strip(),
@@ -313,10 +310,21 @@ def record_to_document(row: Mapping[str, Any]) -> TicketDocument:
         source_dataset=str(row["source_dataset"]).strip(),
         source_row_index=_source_row_index(metadata),
         source_version=source_version,
-        dense_text=dense_text,
-        sparse_text=sparse_text,
-        display_text=sparse_text,
+        dense_text=dense.text,
+        sparse_text=sparse.text,
+        display_text=complete,
         pii_redactions=redactions,
+        text_profile=TEXT_PROFILE,
+        text_token_counts={
+            "dense_tokens": dense.tokens,
+            "dense_original_tokens": dense.original_tokens,
+            "sparse_reference_tokens": sparse.tokens,
+            "sparse_original_reference_tokens": sparse_original,
+            "dense_truncated": int(dense.truncated),
+            "sparse_truncated": int(
+                issue_part.truncated or answer_part.truncated or sparse.truncated
+            ),
+        },
     )
 
 
@@ -326,7 +334,8 @@ def prepare_documents(frame: Any, limit: int | None = None) -> list[TicketDocume
     records = (
         frame.head(limit).to_dict(orient="records") if limit else frame.to_dict(orient="records")
     )
-    return [record_to_document(record) for record in records]
+    settings = PreprocessingSettings()
+    return [record_to_document(record, settings) for record in records]
 
 
 def aggregate_redactions(documents: Sequence[TicketDocument]) -> dict[str, int]:
@@ -370,6 +379,20 @@ def build_report(
         pii_redactions=aggregate_redactions(documents),
         duration_seconds=round(duration_seconds, 2),
         warnings=list(warnings),
+        text_handling={
+            "profile": TEXT_PROFILE,
+            "tokenizer_sha256": TOKENIZER_SHA256,
+            "sparse_counting": "MiniLM reference tokenizer; not a claim about BM25 internal tokenization",
+            "dense_truncated_documents": sum(
+                d.text_token_counts.get("dense_truncated", 0) for d in documents
+            ),
+            "sparse_truncated_documents": sum(
+                d.text_token_counts.get("sparse_truncated", 0) for d in documents
+            ),
+            "max_dense_tokens": max(
+                (d.text_token_counts.get("dense_tokens", 0) for d in documents), default=0
+            ),
+        },
     )
 
 

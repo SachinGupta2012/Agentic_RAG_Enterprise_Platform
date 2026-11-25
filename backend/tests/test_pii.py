@@ -5,6 +5,12 @@ from __future__ import annotations
 from app.retrieval.pii import contains_pii, redact_pii
 
 
+def test_email_at_end_of_sentence_is_redacted_without_losing_punctuation() -> None:
+    redacted, counts = redact_pii("Contact person@example.com.")
+    assert redacted == "Contact [EMAIL_REDACTED]."
+    assert counts.email == 1
+
+
 def test_redacts_email_url_and_phone() -> None:
     text = (
         "Email a.customer@example.com or call +1 (555) 123-4567. "
